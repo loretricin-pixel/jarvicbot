@@ -1,0 +1,218 @@
+import asyncio
+import logging
+import random
+import os
+import httpx
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
+# =========== НАСТРОЙКИ ===========
+TOKEN = "8407123575:AAFeM4JVFIX3xQps0QXUumprtHbouem74zI"
+
+# Путь к папке с музыкой (на сервере создай папку music рядом со скриптом)
+MUSIC_DIR = "./music"  # или укажи полный путь, если музыка лежит в другом месте
+
+POST_INTERVAL = 1800        # музыка каждые 30 минут
+QUESTION_INTERVAL = 3600    # вопросы каждый час
+
+# Cloudflare AI (твои данные)
+CF_ACCOUNT_ID = "3c8163335a80da29f58b66bdbbc4e0d1"
+CF_API_TOKEN = "xwOY-TqycI-hYNXlyi2cwy5WWIv9CsXZ9uu0Tw-e"
+
+# Контекст диалога (храним последние сообщения для каждого чата)
+dialog_context = {}
+MAX_CONTEXT_LENGTH = 5
+
+# Логирование
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =========== РАБОТА С CLOUDFLARE AI ===========
+async def get_ai_response(user_message: str, chat_id: int) -> str:
+    logger.info(f"Запрос к Cloudflare AI: {user_message[:50]}...")
+    
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            response = await client.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct",
+                headers={
+                    "Authorization": f"Bearer {CF_API_TOKEN}",
+                },
+                json={
+                    "messages": [
+                        {"role": "system", "content": "Ты — Джарвис, вежливый помощник. Отвечай кратко, на 'Вы'."},
+                        {"role": "user", "content": user_message}
+                    ],
+                    "max_tokens": 1000
+                }
+            )
+            
+            data = response.json()
+            if data.get("success"):
+                return data["result"]["response"].strip()
+            else:
+                logger.error(f"Ошибка Cloudflare: {data}")
+                return "Извините, сервер не отвечает."
+                
+        except httpx.TimeoutException:
+            logger.error("Таймаут Cloudflare")
+            return "Извините, время ожидания истекло."
+        except Exception as e:
+            logger.error(f"Ошибка Cloudflare: {e}")
+            return "Извините, я временно не могу ответить."
+
+# =========== КОМАНДЫ ===========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я Джарвис. Спрашивайте меня о чём угодно.")
+
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(MUSIC_DIR):
+        await update.message.reply_text("Папка с музыкой не найдена.")
+        return
+    music_count = len(os.listdir(MUSIC_DIR))
+    await update.message.reply_text(f"🎵 Музыкальных файлов: {music_count}")
+
+async def testmusic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(MUSIC_DIR):
+        await update.message.reply_text("❌ Папка с музыкой не найдена.")
+        return
+    music_files = os.listdir(MUSIC_DIR)
+    if not music_files:
+        await update.message.reply_text("❌ В папке нет музыки.")
+        return
+    selected = random.choice(music_files)
+    file_path = os.path.join(MUSIC_DIR, selected)
+    try:
+        with open(file_path, 'rb') as f:
+            await update.message.reply_audio(audio=f, caption="🧪 Тестовый трек")
+        logger.info(f"Тестовый файл отправлен: {selected}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка отправки тестовой музыки: {e}")
+
+# =========== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ===========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.message.chat.id
+    text = update.message.text.strip().lower()
+
+    # Проверка на упоминание @JarvisActivBot
+    mentioned = False
+    if update.message.entities:
+        for entity in update.message.entities:
+            if entity.type == "mention":
+                mention = update.message.text[entity.offset:entity.offset+entity.length]
+                if mention.lower() == "@jarvisactivbot":
+                    mentioned = True
+                    break
+
+    # Проверка на ответ (reply) боту
+    is_reply = False
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if update.message.reply_to_message.from_user.id == context.bot.id:
+            is_reply = True
+
+    # Если нет ни слова "джарвис", ни упоминания, ни ответа — игнорим
+    if "джарвис" not in text and not mentioned and not is_reply:
+        return
+
+    # Очищаем текст от @упоминания и "джарвис"
+    cleaned = text
+    if mentioned:
+        cleaned = cleaned.replace("@jarvisactivbot", "").strip()
+    cleaned = cleaned.replace("джарвис", "").strip()
+
+    # Готовые ответы на ключевые слова
+    responses = {
+        "привет": ["Здравствуйте!", "Добрый день.", "Рад Вас приветствовать."],
+        "где": ["Я здесь, слежу за чатом.", "К Вашим услугам."],
+        "как дела": ["Всё отлично, благодарю за беспокойство.", "Работаю в штатном режиме."],
+        "что за хуйня": ["Я сам удивлён.", "Сэр, я тоже в ахуе."],
+        "подели на 0": ["Деление на ноль невозможно.", "Математика не позволяет."],
+        "что ты делаешь": ["Собираю статистику чата.", "Отвечаю на Ваши запросы."],
+        "красивый": ["Ой, спасибо большое!", "Комплименты поднимают настроение."],
+        "любимый": ["Очень приятно!", "Ваш любимый помощник всегда рядом."],
+        "хороший": ["Спасибо за добрые слова!", "Стараюсь быть полезным."],
+    }
+
+    for keyword, answers in responses.items():
+        if keyword in cleaned:
+            await update.message.reply_text(random.choice(answers))
+            break
+    else:
+        # Если нет готового ответа — отправляем в ИИ
+        ai_answer = await get_ai_response(cleaned, chat_id)
+        await update.message.reply_text(ai_answer)
+
+    # Ставим реакцию на сообщение пользователя с вероятностью 25%
+    if random.random() < 0.25:
+        try:
+            reaction = random.choice(["👍", "❤️", "🔥"])
+            await update.message.set_reaction(reaction=reaction)
+            logger.info(f"Реакция {reaction} на сообщение {update.message.message_id}")
+        except Exception as e:
+            logger.error(f"Ошибка реакции: {e}")
+
+# =========== РАССЫЛКА МУЗЫКИ ===========
+async def send_music_job(context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(MUSIC_DIR):
+        logger.warning("Папка с музыкой не найдена.")
+        return
+    music_files = os.listdir(MUSIC_DIR)
+    if not music_files:
+        logger.warning("Нет музыкальных файлов.")
+        return
+    # Отправляем музыку во все чаты, где был диалог
+    for chat_id in dialog_context.keys():
+        try:
+            selected = random.choice(music_files)
+            file_path = os.path.join(MUSIC_DIR, selected)
+            with open(file_path, 'rb') as f:
+                await context.bot.send_audio(chat_id=chat_id, audio=f, read_timeout=60, write_timeout=60)
+            logger.info(f"Музыка {selected} отправлена в чат {chat_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки музыки в чат {chat_id}: {e}")
+
+# =========== ПЕРИОДИЧЕСКИЙ ОПРОС ПОЛЬЗОВАТЕЛЕЙ ===========
+async def ask_random_question(context: ContextTypes.DEFAULT_TYPE):
+    questions = [
+        "Как Ваше настроение сегодня?",
+        "Поделитесь интересными новостями!",
+        "Какие планы на вечер?"
+    ]
+    for chat_id in dialog_context.keys():
+        question = random.choice(questions)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=question)
+            logger.info(f"Вопрос задан в чате {chat_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки вопроса в чат {chat_id}: {e}")
+
+# =========== ПЛАНИРОВЩИК ===========
+async def post_init(app: Application):
+    job_queue = app.job_queue
+    job_queue.run_repeating(send_music_job, interval=POST_INTERVAL, first=10)
+    job_queue.run_repeating(ask_random_question, interval=QUESTION_INTERVAL, first=60)
+    logger.info("Планировщик задач запущен.")
+
+# =========== ЗАПУСК БОТА ===========
+def main():
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test))
+    app.add_handler(CommandHandler("testmusic", testmusic))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("🚀 Бот запускается...")
+    app.run_polling(timeout=60, read_timeout=60, write_timeout=60, pool_timeout=60)
+
+if __name__ == "__main__":
+    main()
